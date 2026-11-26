@@ -2,12 +2,18 @@
 # POC 02 helper: automated code review of a GitLab MR by Agent Canvas.
 #   scripts/poc02-gitlab-mr-review.sh setup     create the custom webhook + the review automation (enabled)
 #   scripts/poc02-gitlab-mr-review.sh mr        push a test branch, open a draft MR, send the signed event, watch the run
-#   scripts/poc02-gitlab-mr-review.sh event IID send the signed merge_request event for an existing MR number
+#   scripts/poc02-gitlab-mr-review.sh review [IID]  review an existing MR (default: the newest open MR) and watch the run
+#   scripts/poc02-gitlab-mr-review.sh follow    keep running: review every MR opened from now on (for example by the
+#                                               issue-to-MR automation), one at a time. Stop with Ctrl+C.
+#   scripts/poc02-gitlab-mr-review.sh event IID same as review IID (old name)
 #   scripts/poc02-gitlab-mr-review.sh watch     show the latest run of the automation until it finishes
 #   scripts/poc02-gitlab-mr-review.sh cleanup   delete the automation, the webhook, the test MR and branch
 set -euo pipefail
 
 CANVAS=${CANVAS:-http://localhost:8000}
+# glab picks the GitLab host from the current folder's git remote and falls back to
+# gitlab.com, so name the company GitLab for every glab call.
+export GITLAB_HOST=${GITLAB_HOST:-gitlab.technogise.com}
 CONTAINER=${CONTAINER:-agent-canvas}
 SOURCE=technogise-gitlab
 ORG_ID=46d09c5c-7d7d-585f-8c37-a6b45a3de738   # fixed local org id
@@ -65,17 +71,32 @@ setup() {
   jq -r .id "$STATE/automation.json" > "$STATE/automation"
 }
 
-event() {  # $1 = MR iid
-  title=$(glab mr view "$1" -R "$PROJECT" -F json 2>/dev/null | jq -r .title || echo "POC test")
-  SECRET=$(cat "$STATE/secret") IID="$1" TITLE="$title" PROJECT="$PROJECT" \
-  BRANCH="$BRANCH" TARGET="$TARGET" URL="$CANVAS/api/automation/v1/events/$ORG_ID/$SOURCE" \
+# Stop early when setup has not run or cleanup removed what it made; otherwise
+# events reach Canvas, match nothing, and watch waits forever.
+require_setup() {
+  [ -s "$STATE/automation" ] && [ -s "$STATE/secret" ] \
+    || { echo "The review automation is not set up (or cleanup removed it). Run: $0 setup" >&2; exit 1; }
+  api "$A/$(cat "$STATE/automation")" | jq -e .id >/dev/null 2>&1 \
+    || { echo "The review automation no longer exists in Canvas. Run: $0 setup" >&2; exit 1; }
+}
+
+last_run() { api "$A/$(cat "$STATE/automation")/runs?limit=1" | jq -r '.runs[0].id // ""'; }
+
+event() {  # $1 = MR iid. Sends the event GitLab would send when the MR is opened.
+  # The MR's real branches, title and description, so the reviewer diffs the right code.
+  mr_json=$(glab mr view "$1" -R "$PROJECT" -F json) || { echo "MR !$1 not found in $PROJECT" >&2; return 1; }
+  echo "Reviewing MR !$1: $(jq -r '.title + "  (" + .source_branch + " -> " + .target_branch + ")"' <<<"$mr_json")"
+  SECRET=$(cat "$STATE/secret") MR_JSON="$mr_json" PROJECT="$PROJECT" \
+  URL="$CANVAS/api/automation/v1/events/$ORG_ID/$SOURCE" \
   python3 - <<'PY'
 import os, json, time, hmac, hashlib, base64, urllib.request
 e = os.environ
+mr = json.loads(e["MR_JSON"])
 body = json.dumps({"object_kind": "merge_request", "user": {"username": "poc"},
   "project": {"path_with_namespace": e["PROJECT"]},
-  "object_attributes": {"action": "open", "iid": int(e["IID"]), "title": e["TITLE"],
-    "description": "", "source_branch": e["BRANCH"], "target_branch": e["TARGET"]}}).encode()
+  "object_attributes": {"action": "open", "iid": mr["iid"], "title": mr["title"],
+    "description": mr.get("description") or "", "source_branch": mr["source_branch"],
+    "target_branch": mr["target_branch"], "url": mr.get("web_url", "")}}).encode()
 msg_id, ts = "msg_%d" % time.time_ns(), str(int(time.time()))
 raw = e["SECRET"].removeprefix("whsec_")
 try: key = base64.b64decode(raw, validate=True)
@@ -106,15 +127,53 @@ KT
   [ -z "$url" ] && url=$(glab mr view "$BRANCH" -R "$PROJECT" -F json | jq -r .web_url)
   echo "MR: $url"
   cd / && rm -rf "$STATE/wt"
-  event "${url##*/}"
-  watch
+  review "${url##*/}"
 }
 
-watch() {
+review() {  # [$1 = MR iid], default: the newest open MR in the project
+  iid=${1:-$(glab mr list -R "$PROJECT" -F json -P 100 | jq -r 'max_by(.created_at) | .iid // empty')}
+  [ -n "$iid" ] || { echo "No open MR in $PROJECT" >&2; return 1; }
+  require_setup
+  before=$(last_run)
+  resp=$(event "$iid") || return 1
+  echo "$resp"
+  # Canvas answers {"matched": N, ...}; with 0 no review run starts.
+  if ! jq -e '.matched > 0' >/dev/null 2>&1 <<<"$(tail -1 <<<"$resp")"; then
+    echo "No automation accepted the event for MR !$iid, so no review started. Run: $0 setup" >&2
+    return 1
+  fi
+  watch "$before"
+}
+
+follow() {  # Polls GitLab and reviews each newly opened MR once.
+  require_setup
+  seen="$STATE/reviewed"; touch "$seen"
+  open_mrs() { glab mr list -R "$PROJECT" -F json -P 100 | jq -r 'sort_by(.created_at) | .[].iid'; }
+  # MRs already open when follow starts are not reviewed; use "review IID" for those.
+  open_mrs >> "$seen"
+  echo "Watching $PROJECT for new MRs every ${INTERVAL:-30}s (Ctrl+C to stop). Already open: $(sort -un "$seen" | tr '\n' ' ')"
+  while :; do
+    for iid in $(open_mrs); do
+      grep -qx "$iid" "$seen" && continue
+      echo "$iid" >> "$seen"
+      echo "$(date +%T) new MR !$iid"
+      review "$iid" || echo "Review of MR !$iid failed. Retry it with: $0 review $iid"
+    done
+    sleep "${INTERVAL:-30}"
+  done
+}
+
+watch() {  # [$1 = run id to ignore: waits for a run newer than that one]
+  require_setup
   id=$(cat "$STATE/automation")
+  waited=0
   while :; do
     run=$(api "$A/$id/runs?limit=1" | jq '.runs[0] // empty')
-    [ -z "$run" ] && { echo "no run yet"; sleep 5; continue; }
+    if [ -z "$run" ] || { [ -n "${1:-}" ] && [ "$(jq -r .id <<<"$run")" = "$1" ]; }; then
+      waited=$((waited + 5))
+      [ "$waited" -ge 300 ] && { echo "No review run started within 5 minutes; check the automation in Canvas." >&2; return 1; }
+      echo "waiting for the run to start"; sleep 5; continue
+    fi
     st=$(jq -r .status <<<"$run"); echo "$(date +%T) run $(jq -r .id <<<"$run"): $st"
     case "$st" in COMPLETED|FAILED|CANCELLED|SKIPPED)
       jq '{status, conversation_id, cost, error_detail}' <<<"$run"
@@ -133,7 +192,8 @@ cleanup() {
 }
 
 case "${1:-}" in
-  setup|mr|watch|cleanup) "$1" ;;
-  event) event "${2:?MR number needed}"; watch ;;
-  *) sed -n 2,7p "$0" ;;
+  setup|mr|watch|cleanup|follow) "$1" ;;
+  review) review "${2:-}" ;;
+  event) review "${2:?MR number needed}" ;;
+  *) sed -n 2,10p "$0" ;;
 esac
