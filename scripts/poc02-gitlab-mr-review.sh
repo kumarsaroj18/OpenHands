@@ -4,7 +4,8 @@
 #   scripts/poc02-gitlab-mr-review.sh mr        push a test branch, open a draft MR, send the signed event, watch the run
 #   scripts/poc02-gitlab-mr-review.sh review [IID]  review an existing MR (default: the newest open MR) and watch the run
 #   scripts/poc02-gitlab-mr-review.sh follow    keep running: review every MR opened from now on (for example by the
-#                                               issue-to-MR automation), one at a time. Stop with Ctrl+C.
+#                                               issue-to-MR automation), and again after each new push, one at a time.
+#                                               Stop with Ctrl+C.
 #   scripts/poc02-gitlab-mr-review.sh event IID same as review IID (old name)
 #   scripts/poc02-gitlab-mr-review.sh watch     show the latest run of the automation until it finishes
 #   scripts/poc02-gitlab-mr-review.sh cleanup   delete the automation, the webhook, the test MR and branch
@@ -145,20 +146,29 @@ review() {  # [$1 = MR iid], default: the newest open MR in the project
   watch "$before"
 }
 
-follow() {  # Polls GitLab and reviews each newly opened MR once.
+follow() {  # Polls GitLab; reviews each new MR, and reviews it again after each new push.
   require_setup
-  seen="$STATE/reviewed"; touch "$seen"
-  open_mrs() { glab mr list -R "$PROJECT" -F json -P 100 | jq -r 'sort_by(.created_at) | .[].iid'; }
-  # MRs already open when follow starts are not reviewed; use "review IID" for those.
-  open_mrs >> "$seen"
-  echo "Watching $PROJECT for new MRs every ${INTERVAL:-30}s (Ctrl+C to stop). Already open: $(sort -un "$seen" | tr '\n' ' ')"
+  seen="$STATE/reviewed-sha"; touch "$seen"   # one line per review: "<iid> <head commit>"
+  open_mrs() { glab mr list -R "$PROJECT" -F json -P 100 | jq -r 'sort_by(.created_at) | .[] | "\(.iid) \(.sha)"'; }
+  last_sha() { awk -v i="$1" '$1 == i { s = $2 } END { print s }' "$seen"; }
+  # MRs open when follow first sees them are not reviewed until their next push; use "review IID" for those.
+  # MRs follow already knows keep their last reviewed commit, so pushes made while it was stopped are reviewed.
+  rows=$(open_mrs)
+  while read -r iid sha; do
+    if [ -n "$iid" ] && [ -z "$(last_sha "$iid")" ]; then echo "$iid $sha" >> "$seen"; fi
+  done <<<"$rows"
+  echo "Watching $PROJECT for new MRs and new commits every ${INTERVAL:-30}s (Ctrl+C to stop). Open: $(cut -d' ' -f1 <<<"$rows" | tr '\n' ' ')"
   while :; do
-    for iid in $(open_mrs); do
-      grep -qx "$iid" "$seen" && continue
-      echo "$iid" >> "$seen"
-      echo "$(date +%T) new MR !$iid"
-      review "$iid" || echo "Review of MR !$iid failed. Retry it with: $0 review $iid"
-    done
+    rows=$(open_mrs)
+    while read -r iid sha; do
+      [ -n "$iid" ] || continue
+      prev=$(last_sha "$iid")
+      if [ "$prev" = "$sha" ]; then continue; fi
+      # Record before reviewing: a push during the review changes the commit again and is caught next round.
+      echo "$iid $sha" >> "$seen"
+      if [ -z "$prev" ]; then echo "$(date +%T) new MR !$iid"; else echo "$(date +%T) new commits on MR !$iid (now ${sha:0:8})"; fi
+      review "$iid" </dev/null || echo "Review of MR !$iid failed. Retry it with: $0 review $iid"
+    done <<<"$rows"
     sleep "${INTERVAL:-30}"
   done
 }
@@ -195,5 +205,5 @@ case "${1:-}" in
   setup|mr|watch|cleanup|follow) "$1" ;;
   review) review "${2:-}" ;;
   event) review "${2:?MR number needed}" ;;
-  *) sed -n 2,10p "$0" ;;
+  *) sed -n 2,11p "$0" ;;
 esac
