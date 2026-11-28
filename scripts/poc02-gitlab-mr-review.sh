@@ -24,9 +24,14 @@ BRANCH=poc02-agent-canvas-review   # no slash: the repo has a branch named "test
 STATE=${STATE:-$HOME/.poc02}                   # secret + ids, outside any repo
 mkdir -p "$STATE" && chmod 700 "$STATE"
 
-KEY=$(docker exec "$CONTAINER" cat /home/openhands/.openhands/agent-canvas/api-key.txt)
+# A key passed with -e LOCAL_BACKEND_API_KEY replaces the generated one in api-key.txt.
+KEY=$(docker exec "$CONTAINER" printenv LOCAL_BACKEND_API_KEY 2>/dev/null ||
+      docker exec "$CONTAINER" cat /home/openhands/.openhands/agent-canvas/api-key.txt)
 api() { curl -sS -H "X-Session-API-Key: $KEY" -H "Content-Type: application/json" "$@"; }
 A="$CANVAS/api/automation/v1"
+# Stop with a clear message instead of a confusing jq error later.
+code=$(curl -sS -o /dev/null -w '%{http_code}' -H "X-Session-API-Key: $KEY" "$A/webhooks") || code=000
+[ "$code" = 200 ] || { echo "Canvas at $CANVAS refused the API key from container $CONTAINER (HTTP $code)" >&2; exit 1; }
 
 read -r -d '' PROMPT <<'EOF' || true
 You are a code reviewer for the feedback-app-backend project.
